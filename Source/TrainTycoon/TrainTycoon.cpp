@@ -5,6 +5,9 @@
 #include "TrainTycoon.h"
 
 #include <assert.h>
+#include <wrl.h>
+
+#include <GameInput.h>
 
 #define MAX_LOADSTRING 128
 
@@ -36,6 +39,8 @@ extern int APIENTRY _tWinMain(HINSTANCE hInstance,
     UNREFERENCED_PARAMETER(lpCmdLine);
 
     // TODO: Place code here.
+
+    HRESULT hr;
 
     // Initialized counter
     QueryPerformanceFrequency((PLARGE_INTEGER)&g_qpcFrequency);
@@ -70,6 +75,12 @@ extern int APIENTRY _tWinMain(HINSTANCE hInstance,
 
     // Perform application initialization:
    
+    Microsoft::WRL::ComPtr<IGameInput> pGameInput;
+    if (FAILED(hr = GameInputCreate(pGameInput.ReleaseAndGetAddressOf())))
+    {
+        __debugbreak();
+        return FALSE;
+    }
 
     const HACCEL hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_TRAINTYCOON));
 

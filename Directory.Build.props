@@ -9,6 +9,8 @@
 		<IntDir>$(SolutionDir)obj\tmp\$(Platform)\$(Configuration)\$(MSBuildProjectName)\</IntDir>
 		
 		<OutDir>$(SolutionDir)bin\$(Platform)\$(Configuration)\$(MSBuildProjectName)\</OutDir>
+
+		<GDKPath>%GRDKLatest%</GDKPath>
 		
 	</PropertyGroup>
 </Project>
