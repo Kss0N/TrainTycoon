@@ -11,14 +11,21 @@
 
 #define MAX_LOADSTRING 128
 
+extern "C"
+{
+    extern const uint32_t D3D12SDKVersion = 614;
+
+    extern LPCSTR D3D12SDKPath = ".\\D3D12\\";
+}
+
 // Global Variables:
 static _TCHAR 
-g_zTitle[MAX_LOADSTRING],                  // The title bar text
-g_zWindowClass[MAX_LOADSTRING];            // the main window class name
+    g_zTitle[MAX_LOADSTRING],                  // The title bar text
+    g_zWindowClass[MAX_LOADSTRING];            // the main window class name
 static LONGLONG
-g_qpcFrequency,
-g_qpcStartCounter,
-g_qpcCurrentCounter;
+    g_qpcFrequency,
+    g_qpcStartCounter,
+    g_qpcCurrentCounter;
 
 // Forward declarations of functions included in this code module:
 static ATOM             RegisterMainClass(_In_ HINSTANCE hInstance);
@@ -28,6 +35,18 @@ static INT_PTR CALLBACK About(HWND, UINT, WPARAM, LPARAM);
 extern void ExitGame(int code) {
     PostQuitMessage(code);
 }
+
+HRESULT RenderSetup();
+
+HRESULT RenderSurfaceLoad(_In_ HWND);
+
+HRESULT RenderResize(UINT width, UINT height);
+
+void RenderDraw();
+
+HRESULT RenderUpdate();
+
+void RenderTeardown();
 
 _Use_decl_annotations_
 extern int APIENTRY _tWinMain(HINSTANCE hInstance,
@@ -41,6 +60,8 @@ extern int APIENTRY _tWinMain(HINSTANCE hInstance,
     // TODO: Place code here.
 
     HRESULT hr;
+
+    RenderSetup();
 
     // Initialized counter
     QueryPerformanceFrequency((PLARGE_INTEGER)&g_qpcFrequency);
@@ -103,10 +124,11 @@ extern int APIENTRY _tWinMain(HINSTANCE hInstance,
          */
 
 
+        RenderDraw();
     }
 
     // Epilogue
-
+    RenderTeardown();
 
 
     return (int) msg.wParam;
@@ -201,7 +223,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             s_bMaximized = true;
             s_bMinimized = false;
             // Remove taskbar
-
+            
             break;
         }
         case SIZE_RESTORED:
@@ -221,6 +243,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             assert(eSize == SIZE_MAXSHOW || eSize == SIZE_MAXHIDE);
             break;
         }
+
+        RenderResize(width, height);
 
         break;
     }
@@ -276,6 +300,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
         LPCREATESTRUCT pCS = (LPCREATESTRUCT)lParam;
 
+        RenderSurfaceLoad(hWnd);
         break;
     }
     default:
@@ -302,4 +327,184 @@ INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
         break;
     }
     return (INT_PTR)FALSE;
+}
+
+
+
+/*
+* 
+* 
+* 
+*/
+#include <d3d12.h>
+#include <d3dx12.h>
+#include <dxgi1_6.h>
+
+template<class T>
+using ComPtr = Microsoft::WRL::ComPtr<T>;
+constexpr UINT c_FrameCount = 3;
+constexpr DXGI_FORMAT c_RenderTargetFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+constexpr DXGI_FORMAT c_DepthStencilFormat = DXGI_FORMAT_D32_FLOAT;
+
+ComPtr<ID3D12Device10>      device;
+ComPtr<ID3D12CommandQueue>  queue;
+ComPtr<IDXGISwapChain4>     swapChain;
+
+ComPtr<ID3D12CommandAllocator>  allocators[c_FrameCount];
+ComPtr<ID3D12CommandList>       cmdLists[c_FrameCount];
+
+ComPtr<ID3D12DescriptorHeap> rtvHeap;
+ComPtr<ID3D12DescriptorHeap> dsvHeap;
+
+ComPtr<ID3D12Resource> renderTargetBuffers[c_FrameCount];
+ComPtr<ID3D12Resource> depthStencilBuffer;
+
+ComPtr<ID3D12Fence> fence;
+Microsoft::WRL::Wrappers::Event fenceEvent;
+UINT fenceValues[c_FrameCount] = { 0,0,0 };
+
+BOOL bTearing = false;
+UINT rtvHeapIncSize;
+UINT dsvHeapIncSize;
+RECT scissor;
+D3D12_VIEWPORT viewport;
+
+
+
+HRESULT RenderSetup()
+{
+    HRESULT hr = S_OK;
+
+#ifdef _DEBUG
+    ComPtr<ID3D12Debug6> pDebug;
+    if (FAILED(hr = D3D12GetDebugInterface(IID_PPV_ARGS(pDebug.ReleaseAndGetAddressOf())))) {
+        __debugbreak();
+        return hr;
+    }
+#endif // !_DEBUG
+
+    //
+    // TODO: Select Device
+    //
+    if (FAILED(hr = D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_12_1, IID_PPV_ARGS(device.ReleaseAndGetAddressOf())))) {
+        __debugbreak();
+        return hr;
+    }
+
+    const D3D12_COMMAND_QUEUE_DESC queueDesc = {
+        .Type = D3D12_COMMAND_LIST_TYPE_DIRECT,
+        .Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH,
+        .Flags = D3D12_COMMAND_QUEUE_FLAG_NONE
+    };
+    device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(queue.ReleaseAndGetAddressOf()));
+
+    /*
+     * Descriptor Heaps
+     */
+    
+    const D3D12_DESCRIPTOR_HEAP_DESC rtvDesc = {
+        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+        .NumDescriptors = c_FrameCount,
+    };
+    device->CreateDescriptorHeap(&rtvDesc, IID_PPV_ARGS(rtvHeap.ReleaseAndGetAddressOf()));
+    rtvHeapIncSize = device->GetDescriptorHandleIncrementSize(rtvDesc.Type);
+
+    const D3D12_DESCRIPTOR_HEAP_DESC dsvDesc = {
+        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+        .NumDescriptors = 1,
+    };
+    device->CreateDescriptorHeap(&dsvDesc, IID_PPV_ARGS(dsvHeap.ReleaseAndGetAddressOf()));
+    dsvHeapIncSize = device->GetDescriptorHandleIncrementSize(dsvDesc.Type);
+
+    /*
+    * Synchronization objects
+    */
+
+    fenceEvent.Attach(CreateEvent(nullptr, FALSE, FALSE, nullptr));
+
+    device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence.ReleaseAndGetAddressOf()));
+
+    return hr;
+}
+
+_Use_decl_annotations_
+HRESULT RenderSurfaceLoad(HWND hWnd) {
+
+    assert(queue.Get() != nullptr);
+
+
+    UINT factoryFlags = 0;
+#ifdef _DEBUG
+    factoryFlags += DXGI_CREATE_FACTORY_DEBUG;
+#endif // _DEBUG
+
+    ComPtr<IDXGIFactory7> pFactory;
+    CreateDXGIFactory2(factoryFlags, IID_PPV_ARGS(pFactory.GetAddressOf()));
+
+
+    pFactory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &bTearing, sizeof bTearing); 
+
+    const DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {
+        .Width = 256,
+        .Height = 256,
+        .Format = c_RenderTargetFormat,
+        .SampleDesc = {.Count = 1},
+        .BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT,
+        .BufferCount = c_FrameCount,
+        .SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+        .Flags = (bTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u)
+    };
+    ComPtr<IDXGISwapChain1> pDummy;
+    pFactory->CreateSwapChainForHwnd(queue.Get(), hWnd, &swapChainDesc, nullptr, nullptr, pDummy.GetAddressOf());
+
+    pDummy.As(&swapChain);
+
+    return E_NOTIMPL;
+}
+
+HRESULT RenderResize(UINT width, UINT height) {
+    for (auto& rt : renderTargetBuffers) 
+        rt.Reset();
+
+    swapChain->ResizeBuffers(c_FrameCount, width, height, c_RenderTargetFormat, bTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+
+    device->CreateCommittedResource(
+        &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+        D3D12_HEAP_FLAG_NONE,
+        &CD3DX12_RESOURCE_DESC::Tex2D(c_DepthStencilFormat, width, height, 1, 0, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL),
+        D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        &CD3DX12_CLEAR_VALUE(c_DepthStencilFormat, 1.f, 0),
+        IID_PPV_ARGS(depthStencilBuffer.ReleaseAndGetAddressOf())
+    );
+
+    auto dsvHandle = CD3DX12_CPU_DESCRIPTOR_HANDLE(dsvHeap->GetCPUDescriptorHandleForHeapStart());
+    device->CreateDepthStencilView(depthStencilBuffer.Get(), nullptr, dsvHandle);
+
+    auto rtvHandle = CD3DX12_CPU_DESCRIPTOR_HANDLE(rtvHeap->GetCPUDescriptorHandleForHeapStart());
+    for (UINT ix = 0; ix < c_FrameCount; ix++) {
+
+        swapChain->GetBuffer(ix, IID_PPV_ARGS(renderTargetBuffers[ix].GetAddressOf()));
+        device->CreateRenderTargetView(renderTargetBuffers[ix].Get(), nullptr, rtvHandle);
+
+        rtvHandle.Offset(1, rtvHeapIncSize);
+    }
+
+    scissor = CD3DX12_RECT(0, 0, LONG(width), LONG(height));
+
+    viewport = CD3DX12_VIEWPORT(0.f, 0.f, FLOAT(width), FLOAT(height));
+
+    return S_OK;
+}
+
+void RenderDraw() {
+
+
+}
+
+HRESULT RenderUpdate() {
+    return E_NOTIMPL;
+}
+
+void RenderTeardown() {
+
 }
