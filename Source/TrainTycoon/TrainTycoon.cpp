@@ -3,6 +3,7 @@
 
 #include "framework.h"
 #include "TrainTycoon.h"
+#include "ctx_logger.h"
 
 #include <assert.h>
 #include <wrl.h>
@@ -215,7 +216,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         const WORD 
             width = LOWORD(lParam),
             height = HIWORD(lParam),
-            eSize = wParam;
+            eSize = (WORD)wParam;
         switch (eSize)
         {
         case SIZE_MAXIMIZED:
@@ -329,6 +330,10 @@ INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
     return (INT_PTR)FALSE;
 }
 
+void ctx_logger_output(enum ctx_logger_severity, const wchar_t* zMsg, size_t msgSize)
+{
+    OutputDebugStringW(zMsg);
+}
 
 
 /*
@@ -345,13 +350,14 @@ using ComPtr = Microsoft::WRL::ComPtr<T>;
 constexpr UINT c_FrameCount = 3;
 constexpr DXGI_FORMAT c_RenderTargetFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 constexpr DXGI_FORMAT c_DepthStencilFormat = DXGI_FORMAT_D32_FLOAT;
+constexpr float c_ClearColor[4] = { .2f, .2f, .8f, 1.f };
 
 ComPtr<ID3D12Device10>      device;
 ComPtr<ID3D12CommandQueue>  queue;
 ComPtr<IDXGISwapChain4>     swapChain;
 
-ComPtr<ID3D12CommandAllocator>  allocators[c_FrameCount];
-ComPtr<ID3D12CommandList>       cmdLists[c_FrameCount];
+ComPtr<ID3D12CommandAllocator>      allocators[c_FrameCount];
+ComPtr<ID3D12GraphicsCommandList>   cmdLists[c_FrameCount];
 
 ComPtr<ID3D12DescriptorHeap> rtvHeap;
 ComPtr<ID3D12DescriptorHeap> dsvHeap;
@@ -360,9 +366,10 @@ ComPtr<ID3D12Resource> renderTargetBuffers[c_FrameCount];
 ComPtr<ID3D12Resource> depthStencilBuffer;
 
 ComPtr<ID3D12Fence> fence;
-Microsoft::WRL::Wrappers::Event fenceEvent;
-UINT fenceValues[c_FrameCount] = { 0,0,0 };
+Microsoft::WRL::Wrappers::Event hFenceEvent;
+UINT64 fenceValues[c_FrameCount] = { 0,0,0 };
 
+UINT ixCurrentFrame;
 BOOL bTearing = false;
 UINT rtvHeapIncSize;
 UINT dsvHeapIncSize;
@@ -371,7 +378,46 @@ D3D12_VIEWPORT viewport;
 
 
 
-HRESULT RenderSetup()
+void recordCmdList(ID3D12GraphicsCommandList* cmdlist, UINT ixFrame)
+{
+
+    const auto pre_transition = CD3DX12_RESOURCE_BARRIER::Transition(renderTargetBuffers[ixFrame].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);   
+    cmdlist->ResourceBarrier(1, &pre_transition);
+
+    const auto handleRtv = CD3DX12_CPU_DESCRIPTOR_HANDLE(rtvHeap->GetCPUDescriptorHandleForHeapStart(), ixFrame, rtvHeapIncSize);
+    const auto handleDsv = CD3DX12_CPU_DESCRIPTOR_HANDLE(dsvHeap->GetCPUDescriptorHandleForHeapStart());
+    
+    cmdlist->RSSetViewports(1, &viewport);
+    cmdlist->RSSetScissorRects(1, &scissor);
+    cmdlist->OMSetRenderTargets(1, &handleRtv, false, &handleDsv);
+
+    cmdlist->ClearRenderTargetView(handleRtv, c_ClearColor, 0, nullptr);
+    cmdlist->ClearDepthStencilView(handleDsv, D3D12_CLEAR_FLAG_DEPTH, 1.f, 0, 0, nullptr);
+        
+    const auto post_transition = CD3DX12_RESOURCE_BARRIER::Transition(renderTargetBuffers[ixFrame].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+    cmdlist->ResourceBarrier(1, &post_transition);
+
+}
+
+void moveToNextFrame(ID3D12Fence* fence, UINT ixFrame)
+{
+    UINT64 fenceValue = fenceValues[ixFrame];
+
+
+    fenceValues[ixFrame] = fenceValue +1 ;
+
+    if (fence->GetCompletedValue() < fenceValue)
+    {
+        WaitForSingleObject(hFenceEvent.Get(), INFINITE);
+        ResetEvent(hFenceEvent.Get());
+    }
+    
+    fence->SetEventOnCompletion(fenceValues[ixFrame], hFenceEvent.Get());
+
+}
+
+
+HRESULT RenderSetup() 
 {
     HRESULT hr = S_OK;
 
@@ -420,15 +466,25 @@ HRESULT RenderSetup()
     * Synchronization objects
     */
 
-    fenceEvent.Attach(CreateEvent(nullptr, FALSE, FALSE, nullptr));
+    hFenceEvent.Attach(CreateEvent(nullptr, FALSE, FALSE, nullptr));
 
     device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence.ReleaseAndGetAddressOf()));
+
+
+   /*
+   * Command Allocator and Lists
+   */
+    for (UINT ix = 0; ix < c_FrameCount; ix++) {
+        device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocators[ix].ReleaseAndGetAddressOf()));
+        device->CreateCommandList1(0, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_FLAG_NONE, IID_PPV_ARGS(cmdLists[ix].ReleaseAndGetAddressOf()));
+    }
 
     return hr;
 }
 
 _Use_decl_annotations_
-HRESULT RenderSurfaceLoad(HWND hWnd) {
+HRESULT RenderSurfaceLoad(HWND hWnd) 
+{
 
     assert(queue.Get() != nullptr);
 
@@ -489,6 +545,8 @@ HRESULT RenderResize(UINT width, UINT height) {
         rtvHandle.Offset(1, rtvHeapIncSize);
     }
 
+    ixCurrentFrame = swapChain->GetCurrentBackBufferIndex();
+
     scissor = CD3DX12_RECT(0, 0, LONG(width), LONG(height));
 
     viewport = CD3DX12_VIEWPORT(0.f, 0.f, FLOAT(width), FLOAT(height));
@@ -498,7 +556,45 @@ HRESULT RenderResize(UINT width, UINT height) {
 
 void RenderDraw() {
 
+    /*
+    * 
+    */
 
+    allocators[ixCurrentFrame]->Reset();
+    // todo: change initial pipeline.
+    cmdLists[ixCurrentFrame]->Reset(allocators[ixCurrentFrame].Get(), nullptr);
+
+    recordCmdList(cmdLists[ixCurrentFrame].Get(), ixCurrentFrame);
+
+    cmdLists[ixCurrentFrame]->Close();
+
+    ID3D12CommandList* const executables[] = { cmdLists[ixCurrentFrame].Get() };
+    
+    queue->ExecuteCommandLists(_countof(executables), executables);
+
+    swapChain->Present(1, 0);
+
+
+    /*
+    * Move to next frame
+    */
+
+    // Schedule a Signal command in the queue.
+    const UINT64 currentFenceValue = fenceValues[ixCurrentFrame];
+    queue->Signal(fence.Get(), currentFenceValue);
+
+    // Update the frame index.
+    ixCurrentFrame = swapChain->GetCurrentBackBufferIndex();
+
+    // If the next frame is not ready to be rendered yet, wait until it is ready.
+    if (fence->GetCompletedValue() < fenceValues[ixCurrentFrame])
+    {
+        fence->SetEventOnCompletion(fenceValues[ixCurrentFrame], hFenceEvent.Get());
+        WaitForSingleObjectEx(hFenceEvent.Get(), INFINITE, FALSE);
+    }
+
+    // Set the fence value for the next frame.
+    fenceValues[ixCurrentFrame] = currentFenceValue + 1;
 }
 
 HRESULT RenderUpdate() {
